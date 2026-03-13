@@ -1,55 +1,71 @@
+# -*- coding: utf-8 -*-
+"""火山引擎豆包语音合成 HTTP Chunked 最小实现。
+
+PowerShell 环境变量示例：
+    $env:VOLCENGINE_TTS_APP_ID = "your-app-id"
+    $env:VOLCENGINE_TTS_ACCESS_KEY = "your-access-key"
+    $env:VOLCENGINE_TTS_UID = "demo-user"
+
+单条文本示例：
+    uv run python tts/tts_https.py v1 --text "您好，欢迎光临。" --output tts/tts_https_wavs/v1/demo.wav
+    uv run python tts/tts_https.py v2 --text "您好，欢迎光临。" --output tts/tts_https_wavs/v2/demo.wav
+
+批量导出示例：
+    uv run python tts/tts_https.py batch --model v1
+    uv run python tts/tts_https.py batch --model v2
+"""
+
 from __future__ import annotations
 
 import argparse
 import base64
-import io
+import binascii
 import json
 import os
 import re
-import sys
 import uuid
 import wave
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Sequence
-from urllib import error, request
+from typing import Iterable
 
+import requests
 
-API_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional/sse"
-DEFAULT_CLUSTER = "volcano_tts"  # Deprecated: V3 SSE interface does not use cluster.
-DEFAULT_VOICE_TYPE = "zh_female_shuangkuaisisi_moon_bigtts"
-DEFAULT_RESOURCE_ID = "volc.service_type.10029"
-DEFAULT_OUTPUT_DIR_NAME = "tts_https_wavs"
-DEFAULT_UID = "volcengine-tool"
-DEFAULT_TIMEOUT_SECONDS = 90
+API_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 DEFAULT_SAMPLE_RATE = 24000
-SUCCESS_CODE = 0
-SESSION_FINISH_CODE = 20000000
+PCM_CHANNELS = 1
+PCM_SAMPLE_WIDTH = 2
+RESOURCE_ID_V1 = "seed-tts-1.0"
+RESOURCE_ID_V2 = "seed-tts-2.0"
+SPEAKER_V1 = "ICL_zh_female_yry_tob"
+SPEAKER_V2 = "saturn_zh_female_qingyingduoduo_cs_tob"
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_BATCH_INPUT = SCRIPT_DIR / "音频文本案例.md"
+DEFAULT_BATCH_OUTPUT = SCRIPT_DIR / "tts_https_wavs"
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 
 
-class TTSError(RuntimeError):
-    """Base error for TTS operations."""
+class VolcengineTTSError(RuntimeError):
+    """火山引擎 TTS 请求失败。"""
 
+    def __init__(self, message: str, *, code: int | None = None, logid: str | None = None) -> None:
+        self.code = code
+        self.logid = logid
 
-class TTSConfigError(TTSError):
-    """Raised when required configuration is missing or inconsistent."""
+        parts = [message]
+        if code is not None:
+            parts.append(f"code={code}")
+        if logid:
+            parts.append(f"logid={logid}")
 
-
-class TTSRequestError(TTSError):
-    """Raised when the remote API request fails."""
-
-
-class WAVMergeError(TTSError):
-    """Raised when WAV segments cannot be merged."""
+        super().__init__(" | ".join(parts))
 
 
 @dataclass(frozen=True)
-class Credentials:
+class _Credentials:
     app_id: str
-    access_token: str
-    resource_id: str
+    access_key: str
+    uid: str
 
 
 @dataclass(frozen=True)
@@ -59,465 +75,419 @@ class MarkdownSection:
 
 
 @dataclass(frozen=True)
-class MarkdownFailure:
-    title: str
-    reason: str
+class _ModelConfig:
+    model: str
+    resource_id: str
+    speaker: str
 
 
-@dataclass(frozen=True)
-class MarkdownSynthesisResult:
-    outputs: list[Path]
-    failures: list[MarkdownFailure]
+def _load_credentials() -> _Credentials:
+    app_id = os.getenv("VOLCENGINE_TTS_APP_ID", "").strip()
+    access_key = os.getenv("VOLCENGINE_TTS_ACCESS_KEY", "").strip()
+    uid = os.getenv("VOLCENGINE_TTS_UID", "codex-tts").strip() or "codex-tts"
 
-
-@lru_cache(maxsize=1)
-def _load_credentials() -> Credentials:
-    app_id = os.environ.get("VOLC_APP_ID", "").strip() or os.environ.get("VOLC_APP_KEY", "").strip()
-    access_token = os.environ.get("VOLC_ACCESS_TOKEN", "").strip()
-    resource_id = os.environ.get("VOLC_RESOURCE_ID", "").strip() or DEFAULT_RESOURCE_ID
-    if not app_id or not access_token:
-        raise TTSConfigError(
-            "Missing credentials. Set VOLC_APP_ID (or VOLC_APP_KEY) and VOLC_ACCESS_TOKEN first."
+    missing = [
+        name
+        for name, value in (
+            ("VOLCENGINE_TTS_APP_ID", app_id),
+            ("VOLCENGINE_TTS_ACCESS_KEY", access_key),
         )
-    return Credentials(
-        app_id=app_id,
-        access_token=access_token,
-        resource_id=resource_id,
-    )
+        if not value
+    ]
+    if missing:
+        raise VolcengineTTSError(f"缺少环境变量：{', '.join(missing)}")
+
+    return _Credentials(app_id=app_id, access_key=access_key, uid=uid)
 
 
-def _resolve_credentials(resource_id: str | None = None) -> Credentials:
-    credentials = _load_credentials()
-    if resource_id and resource_id.strip():
-        return Credentials(
-            app_id=credentials.app_id,
-            access_token=credentials.access_token,
-            resource_id=resource_id.strip(),
-        )
-    return credentials
+def _get_model_config(model: str) -> _ModelConfig:
+    if model == "v1":
+        return _ModelConfig(model="v1", resource_id=RESOURCE_ID_V1, speaker=SPEAKER_V1)
+    if model == "v2":
+        return _ModelConfig(model="v2", resource_id=RESOURCE_ID_V2, speaker=SPEAKER_V2)
+    raise ValueError(f"不支持的模型：{model}")
 
 
-def _resource_not_granted_message(resource_id: str) -> str:
-    return (
-        "TTS resource is not granted for the current app/token. "
-        f"Current resource id: {resource_id}. "
-        "Use the exact resource id shown in the Volcengine console and confirm this app "
-        "has been granted that TTS resource."
-    )
-
-
-def _is_resource_not_granted(code: object, message: str) -> bool:
-    return "requested resource not granted" in message
-
-
-def _validate_voice_and_resource(voice_type: str, resource_id: str) -> None:
-    if voice_type.startswith("saturn_") and resource_id.startswith("seed-tts-"):
-        raise TTSConfigError(
-            "Current voice_type starts with 'saturn_', which usually indicates a voice-cloning "
-            "or ICL 2.0 speaker. It does not match seed-tts-* public TTS resources. "
-            "Use a public speaker such as zh_female_shuangkuaisisi_moon_bigtts, "
-            "or switch resource_id to the matching seed-icl-2.0 resource."
-        )
-
-
-def _build_payload(
-    text: str,
-    *,
-    voice_type: str,
-) -> dict[str, object]:
-    if not text.strip():
-        raise TTSRequestError("Input text is empty after trimming.")
-
-    return {
-        "user": {
-            "uid": DEFAULT_UID,
-        },
-        "req_params": {
-            "text": text,
-            "speaker": voice_type,
-            "audio_params": {
-                "format": "wav",
-                "sample_rate": DEFAULT_SAMPLE_RATE,
-            },
-        },
-    }
-
-
-def _build_headers(credentials: Credentials, request_id: str) -> dict[str, str]:
+def _build_headers(credentials: _Credentials, resource_id: str) -> dict[str, str]:
     return {
         "X-Api-App-Id": credentials.app_id,
-        "X-Api-Access-Key": credentials.access_token,
-        "X-Api-Resource-Id": credentials.resource_id,
-        "X-Api-Request-Id": request_id,
-        "Accept": "text/event-stream",
+        "X-Api-Access-Key": credentials.access_key,
+        "X-Api-Resource-Id": resource_id,
+        "X-Api-Request-Id": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
 
 
-def _decode_base64_audio(encoded_audio: str) -> bytes:
+def _build_payload(credentials: _Credentials, text: str, speaker: str, sample_rate: int) -> dict[str, object]:
+    return {
+        "user": {"uid": credentials.uid},
+        "req_params": {
+            "text": text,
+            "speaker": speaker,
+            "audio_params": {
+                "format": "pcm",
+                "sample_rate": sample_rate,
+            },
+            "additions": json.dumps({"disable_markdown_filter": True}, ensure_ascii=False),
+        },
+    }
+
+
+def _normalize_text(text: str) -> str:
+    normalized = text.strip()
+    if not normalized:
+        raise ValueError("text 不能为空")
+    return normalized
+
+
+def _synthesize_pcm(
+    text: str,
+    *,
+    credentials: _Credentials,
+    resource_id: str,
+    speaker: str,
+    sample_rate: int,
+    session: requests.Session,
+) -> bytes:
+    normalized_text = _normalize_text(text)
+    response: requests.Response | None = None
+    logid: str | None = None
+
     try:
-        return base64.b64decode(encoded_audio)
-    except (TypeError, ValueError) as exc:
-        raise TTSRequestError("Failed to decode base64 audio data.") from exc
+        response = session.post(
+            API_URL,
+            headers=_build_headers(credentials, resource_id),
+            json=_build_payload(credentials, normalized_text, speaker, sample_rate),
+            stream=True,
+            timeout=(10, 300),
+        )
+        logid = response.headers.get("X-Tt-Logid")
+
+        if response.status_code != 200:
+            body = response.text.strip()
+            if len(body) > 300:
+                body = f"{body[:300]}..."
+            raise VolcengineTTSError(
+                f"HTTP 请求失败：status={response.status_code} body={body or '<empty>'}",
+                logid=logid,
+            )
+
+        audio_chunks = bytearray()
+        finished = False
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+
+            line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode("utf-8").strip()
+            if not line:
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise VolcengineTTSError("解析服务端流式响应失败", logid=logid) from exc
+
+            code = int(event.get("code", 0) or 0)
+            chunk = event.get("data")
+            if code == 0 and chunk:
+                try:
+                    audio_chunks.extend(base64.b64decode(chunk, validate=True))
+                except (binascii.Error, ValueError) as exc:
+                    raise VolcengineTTSError("音频分片 Base64 解码失败", logid=logid) from exc
+                continue
+
+            if code == 0 and "sentence" in event:
+                continue
+
+            if code == 20000000:
+                finished = True
+                break
+
+            raise VolcengineTTSError(
+                event.get("message") or "语音合成失败",
+                code=code,
+                logid=logid,
+            )
+
+        if not finished:
+            raise VolcengineTTSError("服务端未返回结束标记", logid=logid)
+
+        if not audio_chunks:
+            raise VolcengineTTSError("服务端未返回音频数据", logid=logid)
+
+        if len(audio_chunks) % PCM_SAMPLE_WIDTH != 0:
+            raise VolcengineTTSError("返回的 PCM 数据长度异常", logid=logid)
+
+        return bytes(audio_chunks)
+    except requests.RequestException as exc:
+        raise VolcengineTTSError("请求火山引擎 TTS 接口失败", logid=logid) from exc
+    finally:
+        if response is not None:
+            response.close()
 
 
-def _iter_sse_payloads(response) -> Iterable[str]:
-    data_lines: list[str] = []
+def _write_wav(pcm_data: bytes, output_path: str | Path, sample_rate: int) -> Path:
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
 
-    for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-        if not line:
-            if data_lines:
-                yield "\n".join(data_lines)
-                data_lines = []
-            continue
+    with wave.open(str(target), "wb") as wav_file:
+        wav_file.setnchannels(PCM_CHANNELS)
+        wav_file.setsampwidth(PCM_SAMPLE_WIDTH)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_data)
 
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
-
-    if data_lines:
-        yield "\n".join(data_lines)
+    return target
 
 
-def _parse_error_body(body: str, resource_id: str) -> str:
+def _synthesize_to_wav(
+    text: str,
+    output_path: str | Path,
+    *,
+    resource_id: str,
+    speaker: str,
+    sample_rate: int,
+    credentials: _Credentials | None = None,
+    session: requests.Session | None = None,
+) -> Path:
+    own_session = session is None
+    credentials = credentials or _load_credentials()
+    active_session = session or requests.Session()
+
     try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return body
+        pcm_data = _synthesize_pcm(
+            text,
+            credentials=credentials,
+            resource_id=resource_id,
+            speaker=speaker,
+            sample_rate=sample_rate,
+            session=active_session,
+        )
+    finally:
+        if own_session:
+            active_session.close()
 
-    if (
-        isinstance(payload, dict)
-        and _is_resource_not_granted(payload.get("code"), str(payload.get("message", "")))
-    ):
-        return _resource_not_granted_message(resource_id)
-
-    return body
+    return _write_wav(pcm_data, output_path, sample_rate)
 
 
-def _post_tts_request(
-    payload: dict[str, object],
-    credentials: Credentials,
-) -> list[bytes]:
-    request_id = str(uuid.uuid4())
-    request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    http_request = request.Request(
-        API_URL,
-        data=request_body,
-        headers=_build_headers(credentials, request_id),
-        method="POST",
+def synthesize_tts_v1(
+    text: str,
+    output_path: str | Path,
+    *,
+    speaker: str = SPEAKER_V1,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> Path:
+    return _synthesize_to_wav(
+        text,
+        output_path,
+        resource_id=RESOURCE_ID_V1,
+        speaker=speaker,
+        sample_rate=sample_rate,
     )
 
-    try:
-        with request.urlopen(http_request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-            audio_segments: list[bytes] = []
-            log_id = response.headers.get("X-Tt-Logid", "")
 
-            for raw_payload in _iter_sse_payloads(response):
-                try:
-                    message = json.loads(raw_payload)
-                except json.JSONDecodeError as exc:
-                    raise TTSRequestError(f"Invalid SSE payload: {raw_payload}") from exc
-
-                if not isinstance(message, dict):
-                    raise TTSRequestError("Unexpected SSE payload shape from TTS API.")
-
-                code = message.get("code")
-                server_message = str(message.get("message", ""))
-                encoded_audio = message.get("data")
-
-                if code == SUCCESS_CODE:
-                    if isinstance(encoded_audio, str) and encoded_audio:
-                        audio_segments.append(_decode_base64_audio(encoded_audio))
-                    continue
-
-                if code == SESSION_FINISH_CODE:
-                    continue
-
-                if _is_resource_not_granted(code, server_message):
-                    raise TTSRequestError(_resource_not_granted_message(credentials.resource_id))
-
-                suffix = f" (logid: {log_id})" if log_id else ""
-                raise TTSRequestError(f"TTS failed with code {code}: {server_message}{suffix}")
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        parsed_body = _parse_error_body(body, credentials.resource_id)
-        raise TTSRequestError(f"HTTP {exc.code}: {parsed_body}") from exc
-    except error.URLError as exc:
-        raise TTSRequestError(f"Request failed: {exc.reason}") from exc
-
-    if not audio_segments:
-        raise TTSRequestError("TTS stream finished without audio chunks.")
-
-    return audio_segments
+def synthesize_tts_v2(
+    text: str,
+    output_path: str | Path,
+    *,
+    speaker: str = SPEAKER_V2,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> Path:
+    return _synthesize_to_wav(
+        text,
+        output_path,
+        resource_id=RESOURCE_ID_V2,
+        speaker=speaker,
+        sample_rate=sample_rate,
+    )
 
 
-def _sanitize_filename(raw_name: str) -> str:
-    sanitized = INVALID_FILENAME_CHARS.sub("_", raw_name).strip().rstrip(". ")
-    sanitized = re.sub(r"\s+", " ", sanitized)
-    return sanitized or "untitled"
-
-
-def _parse_markdown_sections(markdown_text: str) -> list[MarkdownSection]:
+def parse_markdown_sections(markdown_path: str | Path) -> list[MarkdownSection]:
+    text = Path(markdown_path).read_text(encoding="utf-8")
     sections: list[MarkdownSection] = []
     current_title: str | None = None
     current_lines: list[str] = []
 
-    for line in markdown_text.splitlines():
-        if line.startswith("# "):
-            if current_title is not None and current_lines:
-                sections.append(MarkdownSection(current_title, tuple(current_lines)))
-            current_title = line[2:].strip()
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("# "):
+            if current_title and current_lines:
+                sections.append(MarkdownSection(title=current_title, lines=tuple(current_lines)))
+            current_title = stripped[2:].strip()
             current_lines = []
             continue
 
-        if current_title is None:
+        if not current_title or not stripped:
             continue
 
-        stripped = line.strip()
-        if stripped:
-            current_lines.append(stripped)
+        current_lines.append(stripped)
 
-    if current_title is not None and current_lines:
-        sections.append(MarkdownSection(current_title, tuple(current_lines)))
+    if current_title and current_lines:
+        sections.append(MarkdownSection(title=current_title, lines=tuple(current_lines)))
 
     return sections
 
 
-def _build_output_path(output_dir: Path, title: str, used_names: set[str]) -> Path:
-    base_name = _sanitize_filename(title)
-    candidate_name = f"{base_name}.wav"
+def _sanitize_filename(title: str) -> str:
+    sanitized = INVALID_FILENAME_CHARS.sub("_", title).strip().rstrip(". ")
+    return sanitized or "untitled"
+
+
+def _next_output_path(directory: Path, title: str, used_names: set[str]) -> Path:
+    stem = _sanitize_filename(title)
+    candidate = directory / f"{stem}.wav"
     suffix = 2
 
-    while candidate_name.lower() in used_names:
-        candidate_name = f"{base_name}-{suffix}.wav"
+    while candidate.name.lower() in used_names or candidate.exists():
+        candidate = directory / f"{stem}_{suffix}.wav"
         suffix += 1
 
-    used_names.add(candidate_name.lower())
-    return output_dir / candidate_name
+    used_names.add(candidate.name.lower())
+    return candidate
 
 
-def _read_wav_segment(segment: bytes) -> tuple[tuple[int, int, int, str, str], bytes]:
-    try:
-        with wave.open(io.BytesIO(segment), "rb") as reader:
-            params = (
-                reader.getnchannels(),
-                reader.getsampwidth(),
-                reader.getframerate(),
-                reader.getcomptype(),
-                reader.getcompname(),
-            )
-            frames = reader.readframes(reader.getnframes())
-    except wave.Error as exc:
-        raise WAVMergeError("Received invalid WAV data from TTS API.") from exc
-
-    return params, frames
-
-
-def _merge_wav_segments(segments: Iterable[bytes]) -> bytes:
-    segment_list = list(segments)
-    if not segment_list:
-        raise WAVMergeError("Cannot merge an empty WAV segment list.")
-    if len(segment_list) == 1:
-        return segment_list[0]
-
-    expected_params: tuple[int, int, int, str, str] | None = None
-    pcm_frames: list[bytes] = []
-
-    for segment in segment_list:
-        params, frames = _read_wav_segment(segment)
-        if expected_params is None:
-            expected_params = params
-        elif params != expected_params:
-            raise WAVMergeError("WAV segments have inconsistent audio parameters.")
-        pcm_frames.append(frames)
-
-    assert expected_params is not None
-
-    merged_buffer = io.BytesIO()
-    with wave.open(merged_buffer, "wb") as writer:
-        writer.setnchannels(expected_params[0])
-        writer.setsampwidth(expected_params[1])
-        writer.setframerate(expected_params[2])
-        writer.setcomptype(expected_params[3], expected_params[4])
-        for frames in pcm_frames:
-            writer.writeframes(frames)
-
-    return merged_buffer.getvalue()
-
-
-def _request_tts_audio_bytes(
-    text: str,
+def _combine_section_pcm(
+    lines: Iterable[str],
     *,
-    voice_type: str = DEFAULT_VOICE_TYPE,
-    cluster: str = DEFAULT_CLUSTER,
-    resource_id: str | None = None,
+    credentials: _Credentials,
+    resource_id: str,
+    speaker: str,
+    sample_rate: int,
+    session: requests.Session,
 ) -> bytes:
-    del cluster  # Kept only for backward-compatible function signatures.
-    credentials = _resolve_credentials(resource_id)
-    _validate_voice_and_resource(voice_type, credentials.resource_id)
-    payload = _build_payload(text, voice_type=voice_type)
-    audio_segments = _post_tts_request(payload, credentials)
-    return _merge_wav_segments(audio_segments)
+    audio_parts = [
+        _synthesize_pcm(
+            line,
+            credentials=credentials,
+            resource_id=resource_id,
+            speaker=speaker,
+            sample_rate=sample_rate,
+            session=session,
+        )
+        for line in lines
+    ]
+
+    combined = b"".join(audio_parts)
+    if not combined:
+        raise VolcengineTTSError("章节未生成任何音频数据")
+    return combined
 
 
-def synthesize_text(
-    text: str,
-    output_path: str | Path,
+def _batch_generate_model(
+    sections: list[MarkdownSection],
     *,
-    voice_type: str = DEFAULT_VOICE_TYPE,
-    cluster: str = DEFAULT_CLUSTER,
-    resource_id: str | None = None,
-) -> Path:
-    """Synthesize one text block into a WAV file."""
-    target_path = Path(output_path)
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    audio_bytes = _request_tts_audio_bytes(
-        text,
-        voice_type=voice_type,
-        cluster=cluster,
-        resource_id=resource_id,
-    )
-    target_path.write_bytes(audio_bytes)
-    return target_path
-
-
-def _synthesize_markdown_internal(
-    markdown_path: Path,
     output_dir: Path,
-    *,
-    voice_type: str = DEFAULT_VOICE_TYPE,
-    cluster: str = DEFAULT_CLUSTER,
-    resource_id: str | None = None,
-) -> MarkdownSynthesisResult:
-    credentials = _resolve_credentials(resource_id)
-    _validate_voice_and_resource(voice_type, credentials.resource_id)
-    sections = _parse_markdown_sections(markdown_path.read_text(encoding="utf-8-sig"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    outputs: list[Path] = []
-    failures: list[MarkdownFailure] = []
-    used_names: set[str] = set()
-
-    for section in sections:
-        output_path = _build_output_path(output_dir, section.title, used_names)
-        try:
-            segment_bytes = [
-                _request_tts_audio_bytes(
-                    line,
-                    voice_type=voice_type,
-                    cluster=cluster,
-                    resource_id=credentials.resource_id,
-                )
-                for line in section.lines
-            ]
-            merged_audio = _merge_wav_segments(segment_bytes)
-            output_path.write_bytes(merged_audio)
-            outputs.append(output_path)
-        except TTSError as exc:
-            if output_path.exists():
-                output_path.unlink()
-            failures.append(MarkdownFailure(title=section.title, reason=str(exc)))
-
-    return MarkdownSynthesisResult(outputs=outputs, failures=failures)
-
-
-def synthesize_markdown(
-    markdown_path: str | Path,
-    output_dir: str | Path,
-    *,
-    voice_type: str = DEFAULT_VOICE_TYPE,
-    cluster: str = DEFAULT_CLUSTER,
-    resource_id: str | None = None,
+    resource_id: str,
+    speaker: str,
+    sample_rate: int,
+    credentials: _Credentials,
 ) -> list[Path]:
-    """Synthesize all level-1 markdown sections into chapter WAV files."""
-    result = _synthesize_markdown_internal(
-        Path(markdown_path),
-        Path(output_dir),
-        voice_type=voice_type,
-        cluster=cluster,
-        resource_id=resource_id,
+    output_dir.mkdir(parents=True, exist_ok=True)
+    used_names: set[str] = set()
+    generated_paths: list[Path] = []
+
+    with requests.Session() as session:
+        for section in sections:
+            output_path = _next_output_path(output_dir, section.title, used_names)
+            pcm_data = _combine_section_pcm(
+                section.lines,
+                credentials=credentials,
+                resource_id=resource_id,
+                speaker=speaker,
+                sample_rate=sample_rate,
+                session=session,
+            )
+            generated_paths.append(_write_wav(pcm_data, output_path, sample_rate))
+
+    return generated_paths
+
+
+def synthesize_markdown_cases(
+    markdown_path: str | Path = DEFAULT_BATCH_INPUT,
+    output_root: str | Path = DEFAULT_BATCH_OUTPUT,
+    *,
+    model: str,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> list[Path]:
+    sections = parse_markdown_sections(markdown_path)
+    if not sections:
+        raise ValueError(f"未在 {Path(markdown_path)} 中解析到可合成内容")
+
+    credentials = _load_credentials()
+    root = Path(output_root)
+    config = _get_model_config(model)
+
+    return _batch_generate_model(
+        sections,
+        output_dir=root / config.model,
+        resource_id=config.resource_id,
+        speaker=config.speaker,
+        sample_rate=sample_rate,
+        credentials=credentials,
     )
-    return result.outputs
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Minimal Volcengine HTTPS TTS helper.")
-    parser.add_argument("--text", help="Text to synthesize into one WAV file.")
-    parser.add_argument("--output", help="Output WAV path for --text mode.")
-    parser.add_argument("--markdown", help="Markdown file to batch synthesize by # title.")
-    parser.add_argument(
-        "--voice-type",
-        "--speaker",
-        dest="voice_type",
-        default=DEFAULT_VOICE_TYPE,
-        help="Volcengine speaker id.",
+    parser = argparse.ArgumentParser(
+        description="火山引擎豆包语音合成 HTTP Chunked 最小实现",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "PowerShell 环境变量示例:\n"
+            '  $env:VOLCENGINE_TTS_APP_ID = "your-app-id"\n'
+            '  $env:VOLCENGINE_TTS_ACCESS_KEY = "your-access-key"\n'
+            '  $env:VOLCENGINE_TTS_UID = "demo-user"\n\n'
+            "示例:\n"
+            "  uv run python tts/tts_https.py v1 --text \"您好，欢迎光临。\" --output tts/tts_https_wavs/v1/demo.wav\n"
+            "  uv run python tts/tts_https.py v2 --text \"您好，欢迎光临。\" --output tts/tts_https_wavs/v2/demo.wav\n"
+            "  uv run python tts/tts_https.py batch --model v1\n"
+            "  uv run python tts/tts_https.py batch --model v2\n"
+        ),
     )
-    parser.add_argument(
-        "--cluster",
-        default=DEFAULT_CLUSTER,
-        help="Deprecated. V3 SSE interface ignores this argument.",
-    )
-    parser.add_argument(
-        "--resource-id",
-        default=None,
-        help="Volcengine resource id. Defaults to VOLC_RESOURCE_ID or volc.service_type.10029.",
-    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    for name, default_speaker in (("v1", SPEAKER_V1), ("v2", SPEAKER_V2)):
+        subparser = subparsers.add_parser(name, help=f"{name} 单条文本合成")
+        subparser.add_argument("--text", required=True, help="待合成文本")
+        subparser.add_argument("--output", required=True, help="输出 wav 文件路径")
+        subparser.add_argument("--speaker", default=default_speaker, help="音色 ID")
+        subparser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE, help="采样率，默认 24000")
+
+    batch_parser = subparsers.add_parser("batch", help="按 Markdown 标题批量导出单个模型 wav")
+    batch_parser.add_argument("--model", choices=("v1", "v2"), required=True, help="选择批量导出的模型版本")
+    batch_parser.add_argument("--input", default=str(DEFAULT_BATCH_INPUT), help="Markdown 输入文件，默认音频文本案例.md")
+    batch_parser.add_argument("--output-dir", default=str(DEFAULT_BATCH_OUTPUT), help="输出目录，默认 tts_https_wavs")
+    batch_parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE, help="采样率，默认 24000")
+
     return parser
 
 
-def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    text_mode = bool(args.text)
-    markdown_mode = bool(args.markdown)
-
-    if text_mode == markdown_mode:
-        parser.error("Use exactly one of --text or --markdown.")
-    if text_mode and not args.output:
-        parser.error("--output is required when using --text.")
-
-
-def main(argv: Sequence[str] | None = None) -> int:
+def main() -> None:
     parser = _build_parser()
-    args = parser.parse_args(argv)
-    _validate_args(parser, args)
+    args = parser.parse_args()
 
     try:
-        if args.text:
-            output_path = synthesize_text(
-                args.text,
-                args.output,
-                voice_type=args.voice_type,
-                cluster=args.cluster,
-                resource_id=args.resource_id,
-            )
-            print(f"Generated: {output_path}")
-            return 0
+        if args.command == "v1":
+            path = synthesize_tts_v1(args.text, args.output, speaker=args.speaker, sample_rate=args.sample_rate)
+            print(path)
+            return
 
-        markdown_path = Path(args.markdown)
-        output_dir = Path(__file__).resolve().parent / DEFAULT_OUTPUT_DIR_NAME
-        result = _synthesize_markdown_internal(
-            markdown_path,
-            output_dir,
-            voice_type=args.voice_type,
-            cluster=args.cluster,
-            resource_id=args.resource_id,
+        if args.command == "v2":
+            path = synthesize_tts_v2(args.text, args.output, speaker=args.speaker, sample_rate=args.sample_rate)
+            print(path)
+            return
+
+        paths = synthesize_markdown_cases(
+            args.input,
+            args.output_dir,
+            model=args.model,
+            sample_rate=args.sample_rate,
         )
-
-        print(f"Success: {len(result.outputs)}")
-        for output_path in result.outputs:
-            print(f"  [OK] {output_path.name}")
-
-        if result.failures:
-            print(f"Failed: {len(result.failures)}", file=sys.stderr)
-            for failure in result.failures:
-                print(f"  [FAIL] {failure.title}: {failure.reason}", file=sys.stderr)
-            return 1
-
-        print(f"Output dir: {output_dir}")
-        return 0
-    except (OSError, TTSError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        print(f"{args.model}: {len(paths)} files")
+        for path in paths:
+            print(path)
+    except (ValueError, VolcengineTTSError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
