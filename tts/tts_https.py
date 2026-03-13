@@ -385,19 +385,28 @@ def _batch_generate_model(
     output_dir.mkdir(parents=True, exist_ok=True)
     used_names: set[str] = set()
     generated_paths: list[Path] = []
+    total = len(sections)
 
     with requests.Session() as session:
-        for section in sections:
+        for index, section in enumerate(sections, start=1):
             output_path = _next_output_path(output_dir, section.title, used_names)
-            pcm_data = _combine_section_pcm(
-                section.lines,
-                credentials=credentials,
-                resource_id=resource_id,
-                speaker=speaker,
-                sample_rate=sample_rate,
-                session=session,
-            )
-            generated_paths.append(_write_wav(pcm_data, output_path, sample_rate))
+            print(f"[{index}/{total}] 开始生成：{section.title} -> {output_path}", flush=True)
+            try:
+                pcm_data = _combine_section_pcm(
+                    section.lines,
+                    credentials=credentials,
+                    resource_id=resource_id,
+                    speaker=speaker,
+                    sample_rate=sample_rate,
+                    session=session,
+                )
+                generated_path = _write_wav(pcm_data, output_path, sample_rate)
+            except Exception:
+                print(f"[{index}/{total}] 生成失败：{section.title}", flush=True)
+                raise
+
+            generated_paths.append(generated_path)
+            print(f"[{index}/{total}] 生成完成：{generated_path}", flush=True)
 
     return generated_paths
 
@@ -467,13 +476,15 @@ def main() -> None:
 
     try:
         if args.command == "v1":
+            print(f"[1/1] 开始生成：v1 -> {args.output}", flush=True)
             path = synthesize_tts_v1(args.text, args.output, speaker=args.speaker, sample_rate=args.sample_rate)
-            print(path)
+            print(f"[1/1] 生成完成：{path}", flush=True)
             return
 
         if args.command == "v2":
+            print(f"[1/1] 开始生成：v2 -> {args.output}", flush=True)
             path = synthesize_tts_v2(args.text, args.output, speaker=args.speaker, sample_rate=args.sample_rate)
-            print(path)
+            print(f"[1/1] 生成完成：{path}", flush=True)
             return
 
         paths = synthesize_markdown_cases(
