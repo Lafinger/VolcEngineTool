@@ -40,7 +40,7 @@ RESOURCE_ID_V2 = "seed-tts-2.0"
 SPEAKER_V1 = "ICL_zh_female_yry_tob"
 SPEAKER_V2 = "saturn_zh_female_qingyingduoduo_cs_tob"
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BATCH_INPUT = SCRIPT_DIR / "音频文本案例.md"
+DEFAULT_BATCH_INPUT = SCRIPT_DIR / "音频文本.md"
 DEFAULT_BATCH_OUTPUT = SCRIPT_DIR / "tts_https_wavs"
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 
@@ -463,7 +463,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     batch_parser = subparsers.add_parser("batch", help="按 Markdown 标题批量导出单个模型 wav")
     batch_parser.add_argument("--model", choices=("v1", "v2"), required=True, help="选择批量导出的模型版本")
-    batch_parser.add_argument("--input", default=str(DEFAULT_BATCH_INPUT), help="Markdown 输入文件，默认音频文本案例.md")
+    batch_parser.add_argument("--input", default=str(DEFAULT_BATCH_INPUT), help="Markdown 输入文件，默认音频文本.md")
     batch_parser.add_argument("--output-dir", default=str(DEFAULT_BATCH_OUTPUT), help="输出目录，默认 tts_https_wavs")
     batch_parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE, help="采样率，默认 24000")
 
