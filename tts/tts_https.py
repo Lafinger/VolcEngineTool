@@ -40,7 +40,7 @@ RESOURCE_ID_V2 = "seed-tts-2.0"
 SPEAKER_V1 = "ICL_zh_female_yry_tob"
 SPEAKER_V2 = "saturn_zh_female_qingyingduoduo_cs_tob"
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BATCH_INPUT = SCRIPT_DIR / "音频文本.md"
+DEFAULT_BATCH_INPUT = SCRIPT_DIR / "需合成的文本_中文.md"
 DEFAULT_BATCH_OUTPUT = SCRIPT_DIR / "tts_https_wavs"
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 
@@ -333,17 +333,8 @@ def _sanitize_filename(title: str) -> str:
     return sanitized or "untitled"
 
 
-def _next_output_path(directory: Path, title: str, used_names: set[str]) -> Path:
-    stem = _sanitize_filename(title)
-    candidate = directory / f"{stem}.wav"
-    suffix = 2
-
-    while candidate.name.lower() in used_names or candidate.exists():
-        candidate = directory / f"{stem}_{suffix}.wav"
-        suffix += 1
-
-    used_names.add(candidate.name.lower())
-    return candidate
+def _section_output_path(directory: Path, title: str) -> Path:
+    return directory / f"{_sanitize_filename(title)}.wav"
 
 
 def _combine_section_pcm(
@@ -383,13 +374,16 @@ def _batch_generate_model(
     credentials: _Credentials,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    used_names: set[str] = set()
     generated_paths: list[Path] = []
     total = len(sections)
 
     with requests.Session() as session:
         for index, section in enumerate(sections, start=1):
-            output_path = _next_output_path(output_dir, section.title, used_names)
+            output_path = _section_output_path(output_dir, section.title)
+            if output_path.exists():
+                print(f"[{index}/{total}] 跳过已存在：{section.title} -> {output_path}", flush=True)
+                continue
+
             print(f"[{index}/{total}] 开始生成：{section.title} -> {output_path}", flush=True)
             try:
                 pcm_data = _combine_section_pcm(
@@ -463,7 +457,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     batch_parser = subparsers.add_parser("batch", help="按 Markdown 标题批量导出单个模型 wav")
     batch_parser.add_argument("--model", choices=("v1", "v2"), required=True, help="选择批量导出的模型版本")
-    batch_parser.add_argument("--input", default=str(DEFAULT_BATCH_INPUT), help="Markdown 输入文件，默认音频文本.md")
+    batch_parser.add_argument(
+        "--input",
+        default=str(DEFAULT_BATCH_INPUT),
+        help=f"Markdown 输入文件，默认 {DEFAULT_BATCH_INPUT.name}",
+    )
     batch_parser.add_argument("--output-dir", default=str(DEFAULT_BATCH_OUTPUT), help="输出目录，默认 tts_https_wavs")
     batch_parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE, help="采样率，默认 24000")
 
@@ -493,7 +491,7 @@ def main() -> None:
             model=args.model,
             sample_rate=args.sample_rate,
         )
-        print(f"{args.model}: {len(paths)} files")
+        print(f"{args.model}: generated {len(paths)} new files")
         for path in paths:
             print(path)
     except (ValueError, VolcengineTTSError) as exc:
