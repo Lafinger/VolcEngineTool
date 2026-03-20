@@ -7,13 +7,19 @@
 
 from __future__ import annotations
 
-import audioop
+import argparse
 import shutil
 import subprocess
+import tempfile
+import warnings
 import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+warnings.filterwarnings("ignore", message="'audioop' is deprecated.*", category=DeprecationWarning)
+
+import audioop
 
 DEFAULT_SAMPLE_RATE = 24000
 DEFAULT_CHANNELS = 1
@@ -172,29 +178,13 @@ def convert_mp3_to_wav(
 ) -> Path:
     """将 MP3 转为 WAV。"""
 
-    source = _to_path(mp3_path)
-    _ensure_file_exists(source)
-    spec = AudioSpec(sample_rate=sample_rate, channels=channels, sample_width=sample_width)
-    spec.validate()
-
-    target = _to_path(wav_path)
-    _ensure_parent_dir(target)
-
-    _run_ffmpeg(
-        [
-            "-i",
-            str(source),
-            "-vn",
-            "-ar",
-            str(spec.sample_rate),
-            "-ac",
-            str(spec.channels),
-            "-acodec",
-            _pcm_codec_name(spec.sample_width),
-            str(target),
-        ]
+    return _decode_mp3_to_wav(
+        mp3_path,
+        wav_path,
+        sample_rate=sample_rate,
+        channels=channels,
+        sample_width=sample_width,
     )
-    return target
 
 
 def convert_pcm_to_mp3(
@@ -445,6 +435,123 @@ def resample_wav(
     )
 
 
+def resample_audio_directory(
+    input_dir: str | Path,
+    *,
+    sample_rate: int,
+    pcm_sample_rate: int = DEFAULT_SAMPLE_RATE,
+    pcm_channels: int = DEFAULT_CHANNELS,
+    pcm_sample_width: int = DEFAULT_SAMPLE_WIDTH,
+    mp3_bitrate: str = DEFAULT_MP3_BITRATE,
+) -> list[Path]:
+    """原地重采样目录下的所有受支持音频。"""
+
+    audio_paths = _collect_audio_files(input_dir)
+    pcm_spec = AudioSpec(
+        sample_rate=pcm_sample_rate,
+        channels=pcm_channels,
+        sample_width=pcm_sample_width,
+    )
+    pcm_spec.validate()
+
+    processed_paths: list[Path] = []
+    for audio_path in audio_paths:
+        audio_format = _resolve_audio_format(audio_path, None)
+        temp_output_path = _create_temp_output_path(audio_path.parent, audio_path.suffix)
+        try:
+            if audio_format == "wav":
+                source_spec = read_wav_metadata(audio_path)
+                resample_wav(
+                    audio_path,
+                    temp_output_path,
+                    sample_rate=sample_rate,
+                    channels=source_spec.channels,
+                    sample_width=source_spec.sample_width,
+                )
+            elif audio_format == "mp3":
+                with tempfile.TemporaryDirectory(prefix="audio-resample-", dir=str(audio_path.parent)) as temp_dir:
+                    temp_root = Path(temp_dir)
+                    decoded_path = temp_root / f"{audio_path.stem}.decoded.wav"
+                    resampled_path = temp_root / f"{audio_path.stem}.resampled.wav"
+                    _decode_mp3_to_wav(audio_path, decoded_path, sample_rate=None, channels=None, sample_width=None)
+                    decoded_spec = read_wav_metadata(decoded_path)
+                    resample_wav(
+                        decoded_path,
+                        resampled_path,
+                        sample_rate=sample_rate,
+                        channels=decoded_spec.channels,
+                        sample_width=decoded_spec.sample_width,
+                    )
+                    convert_wav_to_mp3(resampled_path, temp_output_path, bitrate=mp3_bitrate)
+            else:
+                pcm_data = audio_path.read_bytes()
+                _validate_pcm_length(pcm_data, pcm_spec.sample_width, pcm_spec.channels)
+                target_spec = AudioSpec(
+                    sample_rate=sample_rate,
+                    channels=pcm_spec.channels,
+                    sample_width=pcm_spec.sample_width,
+                )
+                converted = _transform_pcm(pcm_data, pcm_spec, target_spec)
+                temp_output_path.write_bytes(converted)
+
+            temp_output_path.replace(audio_path)
+            processed_paths.append(audio_path)
+        except Exception:
+            if temp_output_path.exists():
+                temp_output_path.unlink()
+            raise
+
+    return processed_paths
+
+
+def concatenate_audio_directory(
+    input_dir: str | Path,
+    *,
+    output_name: str = "total.wav",
+    pcm_sample_rate: int = DEFAULT_SAMPLE_RATE,
+    pcm_channels: int = DEFAULT_CHANNELS,
+    pcm_sample_width: int = DEFAULT_SAMPLE_WIDTH,
+) -> Path:
+    """按排序顺序拼接目录下的所有受支持音频为一个 WAV。"""
+
+    output_filename = Path(output_name).name
+    if not output_filename.lower().endswith(".wav"):
+        raise ValueError("output_name 必须使用 .wav 扩展名")
+
+    audio_paths = _collect_audio_files(input_dir, exclude_names={output_filename.lower()})
+    output_dir = _to_path(input_dir)
+    output_path = output_dir / output_filename
+
+    with tempfile.TemporaryDirectory(prefix="audio-splice-", dir=str(output_dir)) as temp_dir:
+        temp_root = Path(temp_dir)
+        first_pcm, first_spec = _read_audio_as_pcm(
+            audio_paths[0],
+            temp_root,
+            pcm_sample_rate=pcm_sample_rate,
+            pcm_channels=pcm_channels,
+            pcm_sample_width=pcm_sample_width,
+        )
+        merged = bytearray(first_pcm)
+
+        for audio_path in audio_paths[1:]:
+            pcm_data, source_spec = _read_audio_as_pcm(
+                audio_path,
+                temp_root,
+                pcm_sample_rate=pcm_sample_rate,
+                pcm_channels=pcm_channels,
+                pcm_sample_width=pcm_sample_width,
+            )
+            merged.extend(_transform_pcm(pcm_data, source_spec, first_spec))
+
+    return write_wav(
+        bytes(merged),
+        output_path,
+        sample_rate=first_spec.sample_rate,
+        channels=first_spec.channels,
+        sample_width=first_spec.sample_width,
+    )
+
+
 def _transform_pcm(pcm_data: bytes, source_spec: AudioSpec, target_spec: AudioSpec) -> bytes:
     """统一 PCM 的采样率、声道数和位宽。"""
 
@@ -530,6 +637,95 @@ def _resolve_audio_format(path: Path, explicit_format: str | None) -> str:
     return normalized
 
 
+def _collect_audio_files(input_dir: str | Path, *, exclude_names: set[str] | None = None) -> list[Path]:
+    directory = _to_path(input_dir)
+    if not directory.is_dir():
+        raise NotADirectoryError(f"目录不存在：{directory}")
+
+    excluded = {name.lower() for name in (exclude_names or set())}
+    audio_paths = [
+        path
+        for path in directory.iterdir()
+        if path.is_file()
+        and path.suffix.lower().lstrip(".") in SUPPORTED_AUDIO_FORMATS
+        and path.name.lower() not in excluded
+    ]
+    audio_paths.sort(key=lambda path: path.name.lower())
+
+    if not audio_paths:
+        raise AudioUtilityError(f"目录中未找到可处理的音频文件：{directory}")
+
+    return audio_paths
+
+
+def _create_temp_output_path(directory: Path, suffix: str) -> Path:
+    with tempfile.NamedTemporaryFile(prefix=".audio-", suffix=suffix, dir=directory, delete=False) as handle:
+        return Path(handle.name)
+
+
+def _read_audio_as_pcm(
+    audio_path: Path,
+    temp_dir: Path,
+    *,
+    pcm_sample_rate: int,
+    pcm_channels: int,
+    pcm_sample_width: int,
+) -> tuple[bytes, AudioSpec]:
+    audio_format = _resolve_audio_format(audio_path, None)
+    if audio_format == "wav":
+        return read_wav_pcm(audio_path)
+    if audio_format == "pcm":
+        spec = AudioSpec(
+            sample_rate=pcm_sample_rate,
+            channels=pcm_channels,
+            sample_width=pcm_sample_width,
+        )
+        spec.validate()
+        pcm_data = audio_path.read_bytes()
+        _validate_pcm_length(pcm_data, spec.sample_width, spec.channels)
+        return pcm_data, spec
+
+    decoded_path = _create_temp_output_path(temp_dir, ".wav")
+    try:
+        _decode_mp3_to_wav(audio_path, decoded_path, sample_rate=None, channels=None, sample_width=None)
+        return read_wav_pcm(decoded_path)
+    finally:
+        if decoded_path.exists():
+            decoded_path.unlink()
+
+
+def _decode_mp3_to_wav(
+    mp3_path: str | Path,
+    wav_path: str | Path,
+    *,
+    sample_rate: int | None,
+    channels: int | None,
+    sample_width: int | None,
+) -> Path:
+    source = _to_path(mp3_path)
+    _ensure_file_exists(source)
+    target = _to_path(wav_path)
+    _ensure_parent_dir(target)
+
+    command = ["-i", str(source), "-vn"]
+    if sample_rate is not None:
+        if sample_rate <= 0:
+            raise ValueError("sample_rate 必须大于 0")
+        command.extend(["-ar", str(sample_rate)])
+    if channels is not None:
+        if channels <= 0:
+            raise ValueError("channels 必须大于 0")
+        command.extend(["-ac", str(channels)])
+    if sample_width is not None:
+        if sample_width not in (1, 2, 3, 4):
+            raise ValueError("sample_width 仅支持 1/2/3/4 字节")
+        command.extend(["-acodec", _pcm_codec_name(sample_width)])
+    command.append(str(target))
+
+    _run_ffmpeg(command)
+    return target
+
+
 def _run_ffmpeg(args: Sequence[str]) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -570,6 +766,112 @@ def _to_path(path: str | Path) -> Path:
     return Path(path)
 
 
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="通用音频处理工具")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    resample_parser = subparsers.add_parser("resample-dir", help="原地重采样目录下的所有音频")
+    resample_parser.add_argument("--input-dir", required=True, help="音频目录路径")
+    resample_parser.add_argument("--sample-rate", type=int, required=True, help="目标采样率，例如 48000")
+    resample_parser.add_argument(
+        "--pcm-sample-rate",
+        type=int,
+        default=DEFAULT_SAMPLE_RATE,
+        help=f"原始 PCM 的输入采样率，默认 {DEFAULT_SAMPLE_RATE}",
+    )
+    resample_parser.add_argument(
+        "--pcm-channels",
+        type=int,
+        default=DEFAULT_CHANNELS,
+        help=f"原始 PCM 的输入声道数，默认 {DEFAULT_CHANNELS}",
+    )
+    resample_parser.add_argument(
+        "--pcm-sample-width",
+        type=int,
+        default=DEFAULT_SAMPLE_WIDTH,
+        help=f"原始 PCM 的输入采样位宽字节数，默认 {DEFAULT_SAMPLE_WIDTH}",
+    )
+    resample_parser.add_argument(
+        "--bitrate",
+        default=DEFAULT_MP3_BITRATE,
+        help=f"MP3 重编码码率，默认 {DEFAULT_MP3_BITRATE}",
+    )
+
+    splice_parser = subparsers.add_parser("splice-dir", help="按顺序拼接目录下的所有音频为一个 WAV")
+    splice_parser.add_argument("--input-dir", required=True, help="音频目录路径")
+    splice_parser.add_argument("--output-name", default="total.wav", help="输出文件名，默认 total.wav")
+    splice_parser.add_argument(
+        "--pcm-sample-rate",
+        type=int,
+        default=DEFAULT_SAMPLE_RATE,
+        help=f"原始 PCM 的输入采样率，默认 {DEFAULT_SAMPLE_RATE}",
+    )
+    splice_parser.add_argument(
+        "--pcm-channels",
+        type=int,
+        default=DEFAULT_CHANNELS,
+        help=f"原始 PCM 的输入声道数，默认 {DEFAULT_CHANNELS}",
+    )
+    splice_parser.add_argument(
+        "--pcm-sample-width",
+        type=int,
+        default=DEFAULT_SAMPLE_WIDTH,
+        help=f"原始 PCM 的输入采样位宽字节数，默认 {DEFAULT_SAMPLE_WIDTH}",
+    )
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_cli_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    try:
+        if args.command == "resample-dir":
+            processed_paths = resample_audio_directory(
+                args.input_dir,
+                sample_rate=args.sample_rate,
+                pcm_sample_rate=args.pcm_sample_rate,
+                pcm_channels=args.pcm_channels,
+                pcm_sample_width=args.pcm_sample_width,
+                mp3_bitrate=args.bitrate,
+            )
+            print(f"扫描到 {len(processed_paths)} 个音频文件")
+            print("实际处理顺序：")
+            for path in processed_paths:
+                print(f"- {path.name}")
+            print(f"输出路径：{_to_path(args.input_dir)}")
+            return 0
+
+        output_path = concatenate_audio_directory(
+            args.input_dir,
+            output_name=args.output_name,
+            pcm_sample_rate=args.pcm_sample_rate,
+            pcm_channels=args.pcm_channels,
+            pcm_sample_width=args.pcm_sample_width,
+        )
+        input_paths = _collect_audio_files(args.input_dir, exclude_names={Path(args.output_name).name.lower()})
+        metadata = read_wav_metadata(output_path)
+        print(f"扫描到 {len(input_paths)} 个音频文件")
+        print("实际处理顺序：")
+        for path in input_paths:
+            print(f"- {path.name}")
+        print(f"输出路径：{output_path}")
+        print(
+            "输出规格："
+            f"sample_rate={metadata.sample_rate}, "
+            f"channels={metadata.channels}, "
+            f"sample_width={metadata.sample_width}"
+        )
+        return 0
+    except (AudioUtilityError, FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = [
     "AudioSpec",
     "AudioUtilityError",
@@ -578,6 +880,7 @@ __all__ = [
     "DEFAULT_SAMPLE_RATE",
     "DEFAULT_SAMPLE_WIDTH",
     "SUPPORTED_AUDIO_FORMATS",
+    "concatenate_audio_directory",
     "concatenate_wav_files",
     "convert_audio_format",
     "convert_mp3_to_pcm",
@@ -588,6 +891,7 @@ __all__ = [
     "convert_wav_to_pcm",
     "read_wav_metadata",
     "read_wav_pcm",
+    "resample_audio_directory",
     "resample_wav",
     "write_wav",
 ]

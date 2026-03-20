@@ -40,7 +40,7 @@ RESOURCE_ID_V2 = "seed-tts-2.0"
 SPEAKER_V1 = "ICL_zh_female_yry_tob"
 SPEAKER_V2 = "saturn_zh_female_qingyingduoduo_cs_tob"
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BATCH_INPUT = SCRIPT_DIR / "需合成的文本_中文.md"
+DEFAULT_BATCH_INPUT = SCRIPT_DIR / "需合成的文本_英文.md"
 DEFAULT_BATCH_OUTPUT = SCRIPT_DIR / "tts_https_wavs"
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 
