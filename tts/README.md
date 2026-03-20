@@ -9,7 +9,8 @@
 - 支持 `v1` / `v2` 两套火山引擎 TTS 预设模型
 - 通过流式 HTTP 响应拼接 PCM 音频，并统一输出为 `.wav`
 - 支持按 Markdown 一级标题批量生成章节音频
-- 自动清洗非法文件名字符，遇到重名时自动追加序号
+- 支持通过 `--batch_file` 直接指定批量输入文件名或路径
+- 自动清洗非法文件名字符，遇到已存在同名音频时自动跳过
 - 提供 `wav` / `pcm` / `mp3` 互转、重采样、拼接等通用工具
 - 保留原始 HTTP Chunked 与 SSE 调用示例，便于调试底层接口
 
@@ -20,7 +21,8 @@ tts/
 |-- README.md
 |-- tts_https.py
 |-- tts_utilities.py
-|-- 音频文本.md
+|-- 需合成的文本_中文.md
+|-- 需合成的文本_英文.md
 |-- demo/
 |   |-- tts_http_demo.py
 |   `-- tts_http_sse_demo.py
@@ -38,7 +40,8 @@ tts/
 
 - [`tts_https.py`](./tts_https.py)：主入口，负责单条 TTS、Markdown 批量解析与 WAV 输出
 - [`tts_utilities.py`](./tts_utilities.py)：音频工具模块，负责元数据读取、格式转换、拼接与重采样
-- [`音频文本.md`](./音频文本.md)：默认批量输入文件
+- [`需合成的文本_中文.md`](./需合成的文本_中文.md)：中文批量输入文件示例
+- [`需合成的文本_英文.md`](./需合成的文本_英文.md)：当前默认的批量输入文件
 - [`materials`](./materials)：额外的中英文样例文本
 - [`demo`](./demo)：更接近底层接口请求格式的参考实现
 - [`tts_https_wavs`](./tts_https_wavs)：仓库内已有的示例输出目录
@@ -123,10 +126,18 @@ uv run python tts/tts_https.py v2 `
 
 ### 按 Markdown 批量合成
 
-使用默认输入文件 [`音频文本.md`](./音频文本.md)：
+使用默认输入文件 [`需合成的文本_英文.md`](./需合成的文本_英文.md)：
 
 ```powershell
 uv run python tts/tts_https.py batch --model v1
+```
+
+使用 `--batch_file` 指定批量输入文件：
+
+```powershell
+uv run python tts/tts_https.py batch `
+  --model v2 `
+  --batch_file "需合成的文本_英文.md"
 ```
 
 使用自定义输入与输出目录：
@@ -134,12 +145,13 @@ uv run python tts/tts_https.py batch --model v1
 ```powershell
 uv run python tts/tts_https.py batch `
   --model v2 `
-  --input tts/materials/音频文本案例_中文.md `
+  --batch_file tts/materials/音频文本案例_中文.md `
   --output-dir tts/output `
   --sample-rate 24000
 ```
 
 批量模式会把文件输出到 `<output-dir>/<model>/` 目录，例如 `tts/output/v2/`。
+如果 `--batch_file` 只给出文件名，脚本会先在当前工作目录查找；找不到时再到 [`tts`](./) 目录下查找同名文件，因此可以直接写 `--batch_file "需合成的文本_英文.md"`。
 
 ## Markdown 输入格式
 
@@ -162,7 +174,7 @@ uv run python tts/tts_https.py batch `
 - 空行会被忽略
 - 章节标题会被转换为输出文件名
 - 文件名中的非法字符会被替换为 `_`
-- 如果标题重名，或目标文件已存在，会自动生成 `xxx_2.wav`、`xxx_3.wav`
+- 如果目标文件已存在，章节会被直接跳过，不会重复合成
 
 ## 命令参数
 
@@ -180,9 +192,14 @@ uv run python tts/tts_https.py batch `
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `--model` | 是 | 选择批量导出的模型版本，取值为 `v1` 或 `v2` |
-| `--input` | 否 | Markdown 输入文件，默认 [`音频文本.md`](./音频文本.md) |
+| `--batch_file` | 否 | Markdown 输入文件，默认 [`需合成的文本_英文.md`](./需合成的文本_英文.md) |
 | `--output-dir` | 否 | 输出根目录，默认 [`tts_https_wavs`](./tts_https_wavs) |
 | `--sample-rate` | 否 | 采样率，默认 `24000` |
+
+说明：
+
+- `--input` 仍可作为兼容别名继续使用，但推荐统一使用 `--batch_file`
+- `--batch_file` 既可以传完整路径，也可以只传 [`tts`](./) 目录下的文件名
 
 ## Python API 用法
 

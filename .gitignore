@@ -208,3 +208,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+tests/__init__.py
+tests/test_tts_https.py

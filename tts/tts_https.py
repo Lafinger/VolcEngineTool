@@ -12,7 +12,7 @@ PowerShell 环境变量示例：
 
 批量导出示例：
     uv run python tts/tts_https.py batch --model v1
-    uv run python tts/tts_https.py batch --model v2
+    uv run python tts/tts_https.py batch --model v2 --batch_file "需合成的文本_英文.md"
 """
 
 from __future__ import annotations
@@ -303,7 +303,7 @@ def synthesize_tts_v2(
 
 
 def parse_markdown_sections(markdown_path: str | Path) -> list[MarkdownSection]:
-    text = Path(markdown_path).read_text(encoding="utf-8")
+    text = _resolve_markdown_path(markdown_path).read_text(encoding="utf-8")
     sections: list[MarkdownSection] = []
     current_title: str | None = None
     current_lines: list[str] = []
@@ -326,6 +326,18 @@ def parse_markdown_sections(markdown_path: str | Path) -> list[MarkdownSection]:
         sections.append(MarkdownSection(title=current_title, lines=tuple(current_lines)))
 
     return sections
+
+
+def _resolve_markdown_path(markdown_path: str | Path) -> Path:
+    path = Path(markdown_path)
+    if path.is_absolute() or path.exists():
+        return path
+
+    script_relative_path = SCRIPT_DIR / path
+    if script_relative_path.exists():
+        return script_relative_path
+
+    raise FileNotFoundError(f"Markdown 输入文件不存在：{path}（也未在 {SCRIPT_DIR} 中找到同名文件）")
 
 
 def _sanitize_filename(title: str) -> str:
@@ -443,7 +455,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  uv run python tts/tts_https.py v1 --text \"您好，欢迎光临。\" --output tts/tts_https_wavs/v1/demo.wav\n"
             "  uv run python tts/tts_https.py v2 --text \"您好，欢迎光临。\" --output tts/tts_https_wavs/v2/demo.wav\n"
             "  uv run python tts/tts_https.py batch --model v1\n"
-            "  uv run python tts/tts_https.py batch --model v2\n"
+            "  uv run python tts/tts_https.py batch --model v2 --batch_file \"需合成的文本_英文.md\"\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -458,7 +470,10 @@ def _build_parser() -> argparse.ArgumentParser:
     batch_parser = subparsers.add_parser("batch", help="按 Markdown 标题批量导出单个模型 wav")
     batch_parser.add_argument("--model", choices=("v1", "v2"), required=True, help="选择批量导出的模型版本")
     batch_parser.add_argument(
+        "--batch_file",
+        "--batch-file",
         "--input",
+        dest="batch_file",
         default=str(DEFAULT_BATCH_INPUT),
         help=f"Markdown 输入文件，默认 {DEFAULT_BATCH_INPUT.name}",
     )
@@ -486,7 +501,7 @@ def main() -> None:
             return
 
         paths = synthesize_markdown_cases(
-            args.input,
+            args.batch_file,
             args.output_dir,
             model=args.model,
             sample_rate=args.sample_rate,
@@ -494,7 +509,7 @@ def main() -> None:
         print(f"{args.model}: generated {len(paths)} new files")
         for path in paths:
             print(path)
-    except (ValueError, VolcengineTTSError) as exc:
+    except (FileNotFoundError, ValueError, VolcengineTTSError) as exc:
         raise SystemExit(str(exc)) from exc
 
 
